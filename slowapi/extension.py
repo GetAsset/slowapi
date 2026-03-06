@@ -26,7 +26,8 @@ from typing import (
 
 from limits import RateLimitItem  # type: ignore
 from limits.errors import ConfigurationError  # type: ignore
-from limits.storage import MemoryStorage, storage_from_string  # type: ignore
+from limits.storage import storage_from_string  # type: ignore
+from limits.aio.storage import MemoryStorage # type: ignore
 from limits.aio.strategies import STRATEGIES, RateLimiter
 from starlette.config import Config
 from starlette.datastructures import MutableHeaders

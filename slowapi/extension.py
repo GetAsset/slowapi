@@ -607,11 +607,25 @@ class Limiter:
                         self._storage_dead = False
                         self.__check_backend_count = 0
                     else:
-                        all_limits = list(itertools.chain(*self._in_memory_fallback))
+                        all_limits = list(
+                            itertools.chain(
+                                *(
+                                    lim.with_request(request)
+                                    for lim in self._in_memory_fallback
+                                )
+                            )
+                        )
             if not all_limits:
                 route_limits: List[Limit] = limits + dynamic_limits
                 all_limits = (
-                    list(itertools.chain(*self._application_limits))
+                    list(
+                        itertools.chain(
+                            *(
+                                lim.with_request(request)
+                                for lim in self._application_limits
+                            )
+                        )
+                    )
                     if in_middleware
                     else []
                 )
@@ -627,7 +641,14 @@ class Limiter:
                     )
                     or combined_defaults
                 ):
-                    all_limits += list(itertools.chain(*self._default_limits))
+                    all_limits += list(
+                        itertools.chain(
+                            *(
+                                lim.with_request(request)
+                                for lim in self._default_limits
+                            )
+                        )
+                    )
             # actually check the limits, so far we've only computed the list of limits to check
             await self.__evaluate_limits(request, _endpoint_key, all_limits)
         except Exception as e:  # no qa

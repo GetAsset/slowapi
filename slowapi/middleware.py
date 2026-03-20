@@ -135,7 +135,9 @@ class SlowAPIMiddleware(BaseHTTPMiddleware):
 
         response = await call_next(request)
         if should_inject_headers:
-            response = limiter._inject_headers(response, request.state.view_rate_limit)
+            view_rate_limit = getattr(request.state, "view_rate_limit", None)
+            if view_rate_limit is not None:
+                response = limiter._inject_headers(response, view_rate_limit)
         return response
 
 
@@ -168,10 +170,14 @@ class _ASGIMiddlewareResponder:
                 self.initial_message["status"] = self.error_response.status_code
 
             if self.inject_headers:
-                headers = MutableHeaders(raw=self.initial_message["headers"])
-                headers = await self.limiter._inject_asgi_headers(
-                    headers, self.request.state.view_rate_limit
+                view_rate_limit = getattr(
+                    self.request.state, "view_rate_limit", None
                 )
+                if view_rate_limit is not None:
+                    headers = MutableHeaders(raw=self.initial_message["headers"])
+                    headers = await self.limiter._inject_asgi_headers(
+                        headers, view_rate_limit
+                    )
 
             # send the http.response.start message just before the http.response.body one,
             # now that the headers are updated

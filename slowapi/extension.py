@@ -602,7 +602,7 @@ class Limiter:
                 if in_middleware and endpoint_func_name in self.__marked_for_limiting:
                     pass
                 else:
-                    if self.__should_check_backend() and self._storage.check():
+                    if self.__should_check_backend() and await self._storage.check():
                         self.logger.info("Rate limit storage recovered")
                         self._storage_dead = False
                         self.__check_backend_count = 0
@@ -639,7 +639,7 @@ class Limiter:
                     " in-memory storage"
                 )
                 self._storage_dead = True
-                self._check_request_limit(request, endpoint_func, in_middleware)
+                await self._check_request_limit(request, endpoint_func, in_middleware)
             else:
                 if self._swallow_errors:
                     self.logger.exception("Failed to rate limit. Swallowing error")

@@ -602,16 +602,30 @@ class Limiter:
                 if in_middleware and endpoint_func_name in self.__marked_for_limiting:
                     pass
                 else:
-                    if self.__should_check_backend() and self._storage.check():
+                    if self.__should_check_backend() and await self._storage.check():
                         self.logger.info("Rate limit storage recovered")
                         self._storage_dead = False
                         self.__check_backend_count = 0
                     else:
-                        all_limits = list(itertools.chain(*self._in_memory_fallback))
+                        all_limits = list(
+                            itertools.chain(
+                                *(
+                                    lim.with_request(request)
+                                    for lim in self._in_memory_fallback
+                                )
+                            )
+                        )
             if not all_limits:
                 route_limits: List[Limit] = limits + dynamic_limits
                 all_limits = (
-                    list(itertools.chain(*self._application_limits))
+                    list(
+                        itertools.chain(
+                            *(
+                                lim.with_request(request)
+                                for lim in self._application_limits
+                            )
+                        )
+                    )
                     if in_middleware
                     else []
                 )
@@ -627,7 +641,14 @@ class Limiter:
                     )
                     or combined_defaults
                 ):
-                    all_limits += list(itertools.chain(*self._default_limits))
+                    all_limits += list(
+                        itertools.chain(
+                            *(
+                                lim.with_request(request)
+                                for lim in self._default_limits
+                            )
+                        )
+                    )
             # actually check the limits, so far we've only computed the list of limits to check
             await self.__evaluate_limits(request, _endpoint_key, all_limits)
         except Exception as e:  # no qa
@@ -639,7 +660,7 @@ class Limiter:
                     " in-memory storage"
                 )
                 self._storage_dead = True
-                self._check_request_limit(request, endpoint_func, in_middleware)
+                await self._check_request_limit(request, endpoint_func, in_middleware)
             else:
                 if self._swallow_errors:
                     self.logger.exception("Failed to rate limit. Swallowing error")

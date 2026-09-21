@@ -24,6 +24,7 @@ from typing import (
     Union,
 )
 
+import anyio
 from limits import RateLimitItem  # type: ignore
 from limits.errors import ConfigurationError  # type: ignore
 from limits.storage import storage_from_string  # type: ignore
@@ -74,7 +75,9 @@ class HEADERS:
 MAX_BACKEND_CHECKS = 5
 
 
-def _rate_limit_exceeded_handler(request: Request, exc: RateLimitExceeded) -> Response:
+async def _rate_limit_exceeded_handler(
+    request: Request, exc: RateLimitExceeded
+) -> Response:
     """
     Build a simple JSON response that includes the details of the rate limit
     that was hit. If no limit is hit, the countdown is added to headers.
@@ -82,7 +85,7 @@ def _rate_limit_exceeded_handler(request: Request, exc: RateLimitExceeded) -> Re
     response = JSONResponse(
         {"error": f"Rate limit exceeded: {exc.detail}"}, status_code=429
     )
-    response = request.app.state.limiter._inject_headers(
+    response = await request.app.state.limiter._inject_headers(
         response, request.state.view_rate_limit
     )
     return response
@@ -376,7 +379,7 @@ class Limiter:
         else:
             return self._limiter
 
-    def _inject_headers(
+    async def _inject_headers(
         self, response: Response, current_limit: Tuple[RateLimitItem, List[str]]
     ) -> Response:
         if self.enabled and self._headers_enabled and current_limit is not None:
@@ -385,7 +388,7 @@ class Limiter:
                     "parameter `response` must be an instance of starlette.responses.Response"
                 )
             try:
-                window_stats: Tuple[int, int] = self.limiter.get_window_stats(
+                window_stats: Tuple[int, int] = await self.limiter.get_window_stats(
                     current_limit[0], *current_limit[1]
                 )
                 reset_in = 1 + window_stats[0]
@@ -420,7 +423,7 @@ class Limiter:
                         " in-memory storage"
                     )
                     self._storage_dead = True
-                    response = self._inject_headers(response, current_limit)
+                    response = await self._inject_headers(response, current_limit)
                 if self._swallow_errors:
                     self.logger.exception(
                         "Failed to update rate limit headers. Swallowing error"
@@ -750,18 +753,20 @@ class Limiter:
                         if self._auto_check and not getattr(
                             request.state, "_rate_limiting_complete", False
                         ):
-                            self._check_request_limit(request, func, False)
+                            await self._check_request_limit(request, func, False)
                             request.state._rate_limiting_complete = True
                     response = await func(*args, **kwargs)  # type: ignore
-                    if self.enabled:
+                    # `_inject_headers` is a no-op when headers are disabled, and
+                    # reaching `view_rate_limit` is not always safe, so skip it.
+                    if self.enabled and self._headers_enabled:
                         if not isinstance(response, Response):
                             # get the response object from the decorated endpoint function
-                            self._inject_headers(
+                            await self._inject_headers(
                                 kwargs.get("response"),  # type: ignore
                                 request.state.view_rate_limit,
                             )
                         else:
-                            self._inject_headers(
+                            await self._inject_headers(
                                 response, request.state.view_rate_limit
                             )
                     return response
@@ -783,19 +788,29 @@ class Limiter:
                         if self._auto_check and not getattr(
                             request.state, "_rate_limiting_complete", False
                         ):
-                            self._check_request_limit(request, func, False)
+                            # Rate limiting is asynchronous, and a sync endpoint runs
+                            # in an anyio worker thread, so hand the coroutine back to
+                            # the event loop driving the request.
+                            anyio.from_thread.run(
+                                self._check_request_limit, request, func, False
+                            )
                             request.state._rate_limiting_complete = True
                     response = func(*args, **kwargs)
-                    if self.enabled:
+                    # Same as above, and here the skipped call also saves a second
+                    # round trip to the event loop.
+                    if self.enabled and self._headers_enabled:
                         if not isinstance(response, Response):
                             # get the response object from the decorated endpoint function
-                            self._inject_headers(
+                            anyio.from_thread.run(
+                                self._inject_headers,
                                 kwargs.get("response"),
                                 request.state.view_rate_limit,  # type: ignore
                             )
                         else:
-                            self._inject_headers(
-                                response, request.state.view_rate_limit
+                            anyio.from_thread.run(
+                                self._inject_headers,
+                                response,
+                                request.state.view_rate_limit,
                             )
                     return response
 

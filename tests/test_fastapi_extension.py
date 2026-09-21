@@ -1,9 +1,13 @@
 import hiro  # type: ignore
 import pytest  # type: ignore
+from fastapi import APIRouter, FastAPI
 from starlette.requests import Request
 from starlette.responses import PlainTextResponse, Response
 from starlette.testclient import TestClient
 
+from slowapi.errors import RateLimitExceeded
+from slowapi.extension import Limiter, _rate_limit_exceeded_handler
+from slowapi.middleware import SlowAPIASGIMiddleware
 from slowapi.util import get_ipaddr
 from tests import TestSlowapi
 
@@ -369,3 +373,136 @@ class TestDecorators(TestSlowapi):
                 )
                 == 2
             )
+
+
+class TestIncludedRouters:
+    """
+    Routes added through `include_router` must still be found by the middleware.
+
+    Since FastAPI 0.138, `app.routes` holds an opaque `_IncludedRouter` node per
+    `include_router` call instead of the flattened sub routes. A middleware that
+    only looks at the top level finds no handler, and slowapi then treats every
+    request as exempt.
+
+    These tests only cover `SlowAPIASGIMiddleware`: `SlowAPIMiddleware` does not
+    await `_check_limits` and is broken for unrelated reasons.
+    """
+
+    def build_app(self, **limiter_args):
+        limiter_args.setdefault("key_func", lambda: "mock")
+        limiter_args.setdefault("storage_uri", "async+memory://")
+        limiter = Limiter(**limiter_args)
+        app = FastAPI()
+        app.state.limiter = limiter
+        app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+        app.add_middleware(SlowAPIASGIMiddleware)
+        return app, limiter
+
+    def test_default_limits_apply_to_included_router(self):
+        app, limiter = self.build_app(default_limits=["2/minute"])
+        router = APIRouter()
+
+        @router.get("/t1")
+        async def t1(request: Request):
+            return PlainTextResponse("test")
+
+        app.include_router(router, prefix="/v0")
+
+        client = TestClient(app)
+        assert [client.get("/v0/t1").status_code for _ in range(3)] == [200, 200, 429]
+
+    def test_default_limits_apply_to_nested_included_router(self):
+        app, limiter = self.build_app(default_limits=["2/minute"])
+        inner = APIRouter()
+
+        @inner.get("/t1/{my_param}")
+        async def t1(my_param: str, request: Request):
+            return PlainTextResponse("test")
+
+        outer = APIRouter()
+        outer.include_router(inner, prefix="/inner")
+        app.include_router(outer, prefix="/v0")
+
+        client = TestClient(app)
+        assert [client.get("/v0/inner/t1/p").status_code for _ in range(3)] == [
+            200,
+            200,
+            429,
+        ]
+
+    def test_default_limits_apply_to_route_added_directly(self):
+        app, limiter = self.build_app(default_limits=["2/minute"])
+
+        @app.get("/t1")
+        async def t1(request: Request):
+            return PlainTextResponse("test")
+
+        client = TestClient(app)
+        assert [client.get("/t1").status_code for _ in range(3)] == [200, 200, 429]
+
+    def test_plain_starlette_route_in_included_router(self):
+        app, limiter = self.build_app(default_limits=["2/minute"])
+        router = APIRouter()
+
+        async def t1(request: Request):
+            return PlainTextResponse("test")
+
+        router.add_route("/t1", t1, methods=["GET"])
+        app.include_router(router, prefix="/v0")
+
+        client = TestClient(app)
+        assert [client.get("/v0/t1").status_code for _ in range(3)] == [200, 200, 429]
+
+    def test_exempt_route_in_included_router(self):
+        app, limiter = self.build_app(default_limits=["2/minute"])
+        router = APIRouter()
+
+        @router.get("/t1")
+        @limiter.exempt
+        async def t1(request: Request):
+            return PlainTextResponse("test")
+
+        app.include_router(router, prefix="/v0")
+
+        client = TestClient(app)
+        assert [client.get("/v0/t1").status_code for _ in range(3)] == [200, 200, 200]
+
+    def test_unknown_route_is_not_limited(self):
+        app, limiter = self.build_app(default_limits=["2/minute"])
+        router = APIRouter()
+
+        @router.get("/t1")
+        async def t1(request: Request):
+            return PlainTextResponse("test")
+
+        app.include_router(router, prefix="/v0")
+
+        client = TestClient(app)
+        assert [client.get("/nope").status_code for _ in range(3)] == [404, 404, 404]
+
+
+class TestHeaderInjection(TestSlowapi):
+    """
+    Header injection reads window stats from the storage, which is async in this
+    fork. A missing `await` there turns every breached request into a 500, and
+    silently marks the storage dead on the way out.
+    """
+
+    def test_middleware_429_goes_through_the_default_handler(self, build_fastapi_app):
+        app, limiter = build_fastapi_app(
+            key_func=lambda: "mock",
+            default_limits=["2/minute"],
+            headers_enabled=True,
+            in_memory_fallback_enabled=True,
+        )
+
+        @app.get("/t1")
+        async def t1(request: Request):
+            return PlainTextResponse("test")
+
+        client = TestClient(app)
+        responses = [client.get("/t1") for _ in range(3)]
+
+        assert [r.status_code for r in responses] == [200, 200, 429]
+        assert responses[0].headers["X-RateLimit-Limit"] == "2"
+        assert not limiter._storage_dead

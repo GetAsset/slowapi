@@ -1,5 +1,5 @@
 import inspect
-from typing import Callable, Iterable, Optional, Tuple
+from typing import Any, Callable, Iterable, Iterator, Optional, Tuple
 
 from starlette.applications import Starlette
 from starlette.datastructures import MutableHeaders
@@ -15,14 +15,50 @@ from starlette.types import ASGIApp, Message, Scope, Receive, Send
 from slowapi import Limiter, _rate_limit_exceeded_handler
 
 
+def _flatten_routes(routes: Iterable[BaseRoute]) -> Iterator[Any]:
+    """
+    Yield the matchable routes of an app.
+
+    Since FastAPI 0.138, `include_router` no longer copies the sub routes into the
+    parent app: it leaves a single `fastapi.routing._IncludedRouter` node holding
+    the original router. Such a node has no `endpoint`, so we expand it into its
+    effective (prefix-aware) route contexts, which expose both `matches()` and the
+    original route. Anything else is yielded as is.
+
+    Upstream bug: https://github.com/laurentS/slowapi/issues/281 (unfixed as of
+    0.1.10; PRs 282, 285 and 286 are open). Unlike those, this also covers plain
+    Starlette routes added to an included router, whose context carries no
+    `endpoint` of its own.
+    """
+    for route in routes:
+        effective_route_contexts = getattr(route, "effective_route_contexts", None)
+        if callable(effective_route_contexts):
+            yield from effective_route_contexts()
+        else:
+            yield route
+
+
+def _route_endpoint(route: Any) -> Optional[Callable]:
+    """
+    The endpoint function of a matchable route, or None if it has no endpoint
+    (a `Mount` for instance).
+    """
+    # `_EffectiveRouteContext` wraps the route it was built from, and only carries
+    # an `endpoint` of its own for API routes.
+    route = getattr(route, "original_route", route)
+    return getattr(route, "endpoint", None)
+
+
 def _find_route_handler(
     routes: Iterable[BaseRoute], scope: Scope
 ) -> Optional[Callable]:
     handler = None
-    for route in routes:
+    for route in _flatten_routes(routes):
         match, _ = route.matches(scope)
-        if match == Match.FULL and hasattr(route, "endpoint"):
-            handler = route.endpoint  # type: ignore
+        if match == Match.FULL:
+            endpoint = _route_endpoint(route)
+            if endpoint is not None:
+                handler = endpoint
     return handler
 
 
@@ -54,27 +90,6 @@ async def _check_limits(
 
         return None, True, None
     return None, False, None
-
-
-def sync_check_limits(
-    limiter: Limiter, request: Request, handler: Optional[Callable], app: Starlette
-) -> Tuple[Optional[Response], bool]:
-    """
-    Returns a `Response` object if an error occurred, as well as a boolean to know
-    whether we should inject headers or not.
-    Used in our WSGI middleware, it only supports synchronous exception_handler.
-    This will fallback on _rate_limit_exceeded_handler otherwise.
-    """
-    exception_handler, _bool, exc = _check_limits(limiter, request, handler, app)
-    if not exception_handler or not exc:
-        return None, _bool
-
-    # cannot execute asynchronous code in a synchronous middleware,
-    # -> fallback on default exception handler
-    if inspect.iscoroutinefunction(exception_handler):
-        exception_handler = _rate_limit_exceeded_handler
-
-    return exception_handler(request, exc), _bool  # type: ignore
 
 
 async def async_check_limits(
@@ -127,7 +142,7 @@ class SlowAPIMiddleware(BaseHTTPMiddleware):
         if _should_exempt(limiter, handler):
             return await call_next(request)
 
-        error_response, should_inject_headers = sync_check_limits(
+        error_response, should_inject_headers = await async_check_limits(
             limiter, request, handler, app
         )
         if error_response is not None:
@@ -137,7 +152,7 @@ class SlowAPIMiddleware(BaseHTTPMiddleware):
         if should_inject_headers:
             view_rate_limit = getattr(request.state, "view_rate_limit", None)
             if view_rate_limit is not None:
-                response = limiter._inject_headers(response, view_rate_limit)
+                response = await limiter._inject_headers(response, view_rate_limit)
         return response
 
 

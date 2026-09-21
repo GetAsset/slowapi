@@ -15,7 +15,7 @@ from slowapi.util import get_remote_address
 
 async def _async_rate_limit_exceeded_handler(request: Request, exc: RateLimitExceeded):
     await asyncio.sleep(0)
-    return _rate_limit_exceeded_handler(request, exc)
+    return await _rate_limit_exceeded_handler(request, exc)
 
 
 class TestSlowapi:
@@ -31,6 +31,7 @@ class TestSlowapi:
             middleware, exception_handler = request.param
 
             limiter_args.setdefault("key_func", get_remote_address)
+            limiter_args.setdefault("storage_uri", "async+memory://")
             limiter = Limiter(**limiter_args)
             app = Starlette(debug=True)
             app.state.limiter = limiter
@@ -55,6 +56,7 @@ class TestSlowapi:
         def _factory(config={}, **limiter_args):
             middleware, exception_handler = request.param
             limiter_args.setdefault("key_func", get_remote_address)
+            limiter_args.setdefault("storage_uri", "async+memory://")
             limiter = Limiter(**limiter_args)
             app = FastAPI()
             app.state.limiter = limiter

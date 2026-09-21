@@ -92,27 +92,6 @@ async def _check_limits(
     return None, False, None
 
 
-def sync_check_limits(
-    limiter: Limiter, request: Request, handler: Optional[Callable], app: Starlette
-) -> Tuple[Optional[Response], bool]:
-    """
-    Returns a `Response` object if an error occurred, as well as a boolean to know
-    whether we should inject headers or not.
-    Used in our WSGI middleware, it only supports synchronous exception_handler.
-    This will fallback on _rate_limit_exceeded_handler otherwise.
-    """
-    exception_handler, _bool, exc = _check_limits(limiter, request, handler, app)
-    if not exception_handler or not exc:
-        return None, _bool
-
-    # cannot execute asynchronous code in a synchronous middleware,
-    # -> fallback on default exception handler
-    if inspect.iscoroutinefunction(exception_handler):
-        exception_handler = _rate_limit_exceeded_handler
-
-    return exception_handler(request, exc), _bool  # type: ignore
-
-
 async def async_check_limits(
     limiter: Limiter, request: Request, handler: Optional[Callable], app: Starlette
 ) -> Tuple[Optional[Response], bool]:
@@ -163,7 +142,7 @@ class SlowAPIMiddleware(BaseHTTPMiddleware):
         if _should_exempt(limiter, handler):
             return await call_next(request)
 
-        error_response, should_inject_headers = sync_check_limits(
+        error_response, should_inject_headers = await async_check_limits(
             limiter, request, handler, app
         )
         if error_response is not None:
@@ -173,7 +152,7 @@ class SlowAPIMiddleware(BaseHTTPMiddleware):
         if should_inject_headers:
             view_rate_limit = getattr(request.state, "view_rate_limit", None)
             if view_rate_limit is not None:
-                response = limiter._inject_headers(response, view_rate_limit)
+                response = await limiter._inject_headers(response, view_rate_limit)
         return response
 
 

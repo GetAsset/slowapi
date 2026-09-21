@@ -479,3 +479,30 @@ class TestIncludedRouters:
 
         client = TestClient(app)
         assert [client.get("/nope").status_code for _ in range(3)] == [404, 404, 404]
+
+
+class TestHeaderInjection(TestSlowapi):
+    """
+    Header injection reads window stats from the storage, which is async in this
+    fork. A missing `await` there turns every breached request into a 500, and
+    silently marks the storage dead on the way out.
+    """
+
+    def test_middleware_429_goes_through_the_default_handler(self, build_fastapi_app):
+        app, limiter = build_fastapi_app(
+            key_func=lambda: "mock",
+            default_limits=["2/minute"],
+            headers_enabled=True,
+            in_memory_fallback_enabled=True,
+        )
+
+        @app.get("/t1")
+        async def t1(request: Request):
+            return PlainTextResponse("test")
+
+        client = TestClient(app)
+        responses = [client.get("/t1") for _ in range(3)]
+
+        assert [r.status_code for r in responses] == [200, 200, 429]
+        assert responses[0].headers["X-RateLimit-Limit"] == "2"
+        assert not limiter._storage_dead
